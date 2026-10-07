@@ -48,14 +48,15 @@ int eval()
         case LEA: ax = (int)(bp + *pc++); break;
         case IMM: ax = *pc++; break;
         case JMP: pc = (int *)(uintptr_t)*pc; break;
-        case CALL: *--sp = (int *)(uintptr_t)(pc + 1); pc = (int *)(uintptr_t)*pc; break;
+        case CALL: *--sp = (uintptr_t)(pc + 1); pc = (int *)(uintptr_t)*pc; break;
         case JZ: pc = ax ? pc + 1 : (int *)(uintptr_t)*pc; break;
         case JNZ: pc = ax ? (int *)(uintptr_t)*pc : pc + 1; break;
-        case ENT: *--sp = (int *)(uintptr_t)bp; bp = sp; sp = sp - *pc++; break;
+        case ENT: *--sp = (uintptr_t)bp; bp = sp; sp = sp - *pc++; break;
         case ADJ: sp = sp + *pc++; break;
         case LEV: sp = bp; bp = (int *)(uintptr_t)*sp++; pc = (int *)(uintptr_t)*sp++; break;
         case LI: ax = *(int *)(uintptr_t)ax; break;
         case LC: ax = *(char *)(uintptr_t)ax  ; break;
+
         case SI: *(int *)(uintptr_t)*sp++ = ax; break;
         case SC: *(char *)(uintptr_t)*sp++ = ax; break;
         case PUSH: *--sp = ax; break;
