@@ -1,135 +1,245 @@
+```c
+/*
+ * interpreter.c
+ *
+ * Standard 64-bit Stack-Based Bytecode Interpreter
+ *
+ * C standard:
+ *     C11
+ *
+ * Build:
+ *     gcc -std=c11 -Wall -Wextra -Wpedantic -O2 interpreter.c -o interpreter
+ *
+ * Windows / MinGW:
+ *     gcc -std=c11 -Wall -Wextra -Wpedantic -O2 interpreter.c -o interpreter.exe
+ *
+ * This is a bytecode virtual machine. It is designed so that a lexer,
+ * parser, AST and bytecode compiler can be added later without having
+ * to rewrite the VM.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
-#include <memory.h>
-#include <fcntl.h>
-#include <unistd.h>
 #include <stdint.h>
-#include <stdarg.h>
-#include <string.h>
 #include <stdbool.h>
-#define int long long
+#include <string.h>
+#include <inttypes.h>
+#include <limits.h>
 
-int token; // current token
-char *src, *oldsrc; // source code
-int poolsize = 256 * 1024; // size of text/data/stack
-int *pc, *sp, *bp; 
-int ax, cycle; // virtual machine registers
-int *text, *stack, *data; // text/data segment
+/* ============================================================
+ * Configuration
+ * ============================================================ */
 
-enum { LEA, IMM, JMP, CALL, JZ, JNZ, ENT, ADJ, LEV, LI, LC, SI, SC, PUSH,
-    OR, XOR, AND, EQ, NE, LT, GT, LE, GE, SHL, SHR,
-    ADD, SUB, MUL, DIV, MOD,
-    OPEN, READ, CLOS,
-    PRTF,
-    MALC,
-    MSET,
-    MCMP,
-    EXIT
-};
+#define VM_STACK_BYTES  (256u * 1024u)
+#define VM_HEAP_BYTES   (256u * 1024u)
+#define VM_CODE_BYTES   (64u  * 1024u)
 
-int eval()
+#define VM_STACK_VALUES \
+    (VM_STACK_BYTES / sizeof(Value))
+
+/* ============================================================
+ * VM Value Types
+ * ============================================================ */
+
+typedef int64_t  Value;
+typedef uint64_t UValue;
+
+/* ============================================================
+ * Opcode Definitions
+ * ============================================================ */
+
+typedef enum
 {
-    int op, *tmp;
+    /* Program */
+    OP_HALT = 0,
 
-    // Initislize registers
-    pc = (int *)text;  //program counter points of start code
-    sp = (int *)((uintptr_t)stack + (uintptr_t)poolsize);  //stack pointer points to the end of stack
-    bp = sp;  //base pointer points to the end of stack
-    ax = 0;  //accumulator register
-    cycle = 0;  //cycle counter
-    
-    while (1)
+    /* Constants / stack */
+    OP_CONST,
+    OP_PUSH,
+    OP_POP,
+    OP_DUP,
+
+    /* Arithmetic */
+    OP_ADD,
+    OP_SUB,
+    OP_MUL,
+    OP_DIV,
+    OP_MOD,
+
+    /* Bitwise */
+    OP_OR,
+    OP_XOR,
+    OP_AND,
+    OP_SHL,
+    OP_SHR,
+
+    /* Comparisons */
+    OP_EQ,
+    OP_NE,
+    OP_LT,
+    OP_GT,
+    OP_LE,
+    OP_GE,
+
+    /* Control flow */
+    OP_JMP,
+    OP_JZ,
+    OP_JNZ,
+
+    /* Functions */
+    OP_CALL,
+    OP_RET,
+
+    /* Stack frames */
+    OP_ENTER,
+    OP_LEAVE,
+    OP_ADJ,
+
+    /* VM heap */
+    OP_MALLOC,
+    OP_FREE,
+
+    /* Memory */
+    OP_LOAD8,
+    OP_LOAD64,
+    OP_STORE8,
+    OP_STORE64,
+
+    /* Memory utilities */
+    OP_MEMSET,
+    OP_MEMCMP,
+
+    /* I/O */
+    OP_PRINT
+
+} Opcode;
+
+/* ============================================================
+ * VM Structure
+ * ============================================================ */
+
+typedef struct
+{
+    /* --------------------------------------------------------
+     * Bytecode
+     * -------------------------------------------------------- */
+
+    const uint8_t *code;
+    size_t code_size;
+
+    /* Instruction pointer */
+    size_t ip;
+
+    /* --------------------------------------------------------
+     * Operand / call stack
+     * -------------------------------------------------------- */
+
+    Value *stack;
+
+    size_t stack_capacity;
+    size_t sp;
+
+    /*
+     * Frame pointer.
+     *
+     * A call frame is:
+
+         fp + 0 : return address
+         fp + 1 : previous frame pointer
+         fp + 2 : local variables / frame data
+     */
+    size_t fp;
+
+    /* --------------------------------------------------------
+     * VM heap
+     * -------------------------------------------------------- */
+
+    uint8_t *heap;
+
+    size_t heap_size;
+    size_t heap_used;
+
+    /* --------------------------------------------------------
+     * Registers / state
+     * -------------------------------------------------------- */
+
+    Value ax;
+
+    bool running;
+
+    int exit_code;
+
+    uint64_t cycles;
+
+} VM;
+
+/* ============================================================
+ * Bytecode Builder
+ * ============================================================ */
+
+typedef struct
+{
+    uint8_t *data;
+
+    size_t size;
+    size_t capacity;
+
+} Bytecode;
+
+/* ============================================================
+ * Error Handling
+ * ============================================================ */
+
+static void vm_error(VM *vm, const char *message)
+{
+    fprintf(
+        stderr,
+        "\nVM ERROR at instruction pointer %zu:\n"
+        "  %s\n",
+        vm->ip,
+        message
+    );
+
+    vm->running = false;
+    vm->exit_code = EXIT_FAILURE;
+}
+
+/* ============================================================
+ * VM Initialization
+ * ============================================================ */
+
+static bool vm_init(
+    VM *vm,
+    size_t stack_capacity,
+    size_t heap_size
+)
+{
+    memset(vm, 0, sizeof(*vm));
+
+    vm->stack = calloc(
+        stack_capacity,
+        sizeof(Value)
+    );
+
+    if (vm->stack == NULL)
     {
-      cycle++;
-      op = *pc++;  //fetch the next instruction
+        fprintf(
+            stderr,
+            "Failed to allocate VM stack.\n"
+        );
 
-      switch (op)
-      {
-        case LEA: ax = (int)(bp + *pc++); break;
-        case IMM: ax = *pc++; break;
-        case JMP: pc = (int *)(uintptr_t)*pc; break;
-        case CALL: *--sp = (uintptr_t)(pc + 1); pc = (int *)(uintptr_t)*pc; break;
-        case JZ: pc = ax ? pc + 1 : (int *)(uintptr_t)*pc; break;
-        case JNZ: pc = ax ? (int *)(uintptr_t)*pc : pc + 1; break;
-        case ENT: *--sp = (uintptr_t)bp; bp = sp; sp = sp - *pc++; break;
-        case ADJ: sp = sp + *pc++; break;
-        case LEV: sp = bp; bp = (int *)(uintptr_t)*sp++; pc = (int *)(uintptr_t)*sp++; break;
-        case LI: ax = *(int *)(uintptr_t)ax; break;
-        case LC: ax = *(char *)(uintptr_t)ax  ; break;
-
-        case SI: *(int *)(uintptr_t)*sp++ = ax; break;
-        case SC: *(char *)(uintptr_t)*sp++ = ax; break;
-        case PUSH: *--sp = ax; break;
-
-        // ALU operations
-        case OR: ax = *sp++ | ax; break;
-        case XOR: ax = *sp++ ^ ax; break;
-        case AND: ax = *sp++ & ax; break;
-        case EQ: ax = *sp++ == ax; break;
-        case NE: ax = *sp++ != ax; break;
-        case LT: ax = *sp++ < ax; break;
-        case GT: ax = *sp++ > ax; break;
-        case LE: ax = *sp++ <= ax; break;
-        case GE: ax = *sp++ >= ax; break;
-
-        // Arithmetic operations
-        case SHL: ax = *sp++ << ax; break;
-        case SHR: ax = *sp++ >> ax; break;
-        case ADD: ax = *sp++ + ax; break;
-        case SUB: ax = *sp++ - ax; break;
-        case MUL: ax = *sp++ * ax; break;
-        case DIV: ax = *sp++ / ax; break;
-        case MOD: ax = *sp++ % ax; break;  
-        
-        case PRTF:
-        printf("%d", ax);
-        break;
-
-        case EXIT:
-        return ax;
-
-        default:
-        printf("Unknown instruction: %d\n", op);
-        return -1; // exit with error
-
-
-
+        return false;
     }
-    printf("Cycle: %d, Instruction: %d, AX: %d\n", cycle, op, ax);
-    
-}
-}
 
-// --- main funtion ---
-int main(int argc, char **argv)
-{
-text = (int *)malloc(poolsize);  //allocate memory for text segment
-stack = (int *)malloc(poolsize);  //allocate memory for stack segment
-data = (int *)malloc(poolsize);    //   allocated memory for data 
+    vm->stack_capacity = stack_capacity;
 
-if (!text || !stack || !data)
-{
-    printf("Memory allocation failed!\n");
-    return 1;
+    vm->heap = calloc(
+        heap_size,
+        sizeof(uint8_t)
+    );
 
-}
-
-int *prog = text;
-*prog++ = IMM; *prog++ = 10; 
-*prog++ = PUSH; 
-*prog++ = IMM; *prog++ = 20; 
-*prog++ = ADD; 
-*prog++ = PRTF; 
-*prog++ = EXIT;
-
-printf("Starting the virtual machine...\n");
-int result = eval();
-printf("Virtual machine finished with result: %d\n", result);
-
-
-free(text);
-free(stack);
-free(data);
-
-return 0;
-}
+    if (vm->heap == NULL)
+    {
+        fprintf(
+            stderr,
+```
